@@ -1,0 +1,344 @@
+---
+title: "Predicting Exoplanet Mass from Radius and Stellar Parameters"
+subtitle: "HarvardX PH125.9x Choose Your Own Capstone Project"
+author: "Romain"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+```
+
+```{r libraries, include=FALSE}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(randomForest)) install.packages("randomForest", repos = "http://cran.us.r-project.org")
+if(!require(gbm)) install.packages("gbm", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(gbm)
+```
+
+# Introduction
+
+Roughly half of all confirmed exoplanets have a measured radius but no measured mass. That's not a data quality problem, it's a physical one: radius comes essentially for free once you've detected a transiting planet (you measure how much the star's light dims), while mass needs radial-velocity follow-up - watching the star wobble as the planet tugs on it, which is expensive telescope time and often just isn't feasible for faint or distant stars. This project asks whether mass can be predicted well enough from radius and a handful of other available parameters to be useful for planets where the "real" measurement isn't practical.
+
+I'm using the NASA Exoplanet Archive's confirmed planets table, pulled directly from their public TAP API. This isn't a dataset that gets used as a course example - I built it myself for this project, and most of the interesting columns in it don't come from the archive at all. I derived them: recovering missing orbital distances via Kepler's third law, computing stellar luminosity and planet equilibrium temperature from first principles, and classifying each planet's habitable-zone status using established astrophysical formulas rather than relying on any pre-computed label. The final engineered dataset covers `r nrow(read.csv("exoplanets_engineered.csv"))` confirmed exoplanets.
+
+The core task is a regression problem: predict `log10(planet mass in Earth masses)` from planet radius, orbital period, and stellar temperature/radius/mass, using three different modeling approaches - linear regression, random forest, and gradient boosting - and compare how well each does on a held-out test set. I also use the habitable-zone and equilibrium-temperature calculations to explore the dataset more broadly, though those aren't the prediction target; they're there because they turned out to be some of the more interesting things to look at once I had them.
+
+# Methods and Analysis
+
+## Getting the data
+
+```{r download-data, cache=TRUE}
+raw_file <- "exoplanets_raw.csv"
+
+github_url <- "https://raw.githubusercontent.com/YOUR-GITHUB-USERNAME/YOUR-REPO/main/exoplanets_raw.csv"
+nasa_url <- paste0(
+  "https://exoplanetarchive.ipac.caltech.edu/TAP/sync?query=",
+  "select+pl_name,hostname,discoverymethod,disc_year,pl_orbper,",
+  "pl_rade,pl_bmasse,pl_orbsmax,pl_eqt,st_teff,st_rad,st_mass,",
+  "sy_dist,st_met+from+ps+where+default_flag=1&format=csv"
+)
+
+if (!file.exists(raw_file)) {
+  ok <- tryCatch({
+    download.file(github_url, raw_file, quiet = TRUE)
+    TRUE
+  }, error = function(e) FALSE)
+
+  if (!ok || !file.exists(raw_file) || file.info(raw_file)$size < 1000) {
+    download.file(nasa_url, raw_file, quiet = TRUE)
+  }
+}
+
+d <- read.csv(raw_file, stringsAsFactors = FALSE)
+nrow(d)
+```
+
+`r nrow(d)` confirmed exoplanets, 14 columns: planet name, host star name, discovery method and year, orbital period, planet radius and mass, orbital semi-major axis, equilibrium temperature, and four stellar parameters (temperature, radius, mass, metallicity).
+
+## Data cleaning and feature engineering
+
+This is where most of the actual work in this project happened. A few columns are missing often enough that it's worth understanding *why*, not just imputing blindly:
+
+```{r missingness}
+d %>%
+  summarize(
+    missing_mass = sum(is.na(pl_bmasse)),
+    missing_radius = sum(is.na(pl_rade)),
+    missing_orbsmax = sum(is.na(pl_orbsmax)),
+    missing_archive_eqt = sum(is.na(pl_eqt))
+  )
+```
+
+Mass is missing for about half the sample, and it's missing *because* it requires radial-velocity follow-up that many transit-discovered planets never get - this is exactly the gap the project is trying to help close, not a random data quality issue. Orbital semi-major axis is missing for a large chunk too, but that one I can actually recover: Kepler's third law relates it directly to orbital period and stellar mass, both of which are much more commonly available.
+
+```{r kepler-derivation}
+d <- d %>%
+  mutate(
+    pl_orbper_yr = pl_orbper / 365.25,
+    orbsmax_derived = ifelse(is.na(pl_orbsmax) & !is.na(pl_orbper) & !is.na(st_mass),
+                              (pl_orbper_yr^2 * st_mass)^(1/3),
+                              NA_real_),
+    a_au = ifelse(!is.na(pl_orbsmax), pl_orbsmax, orbsmax_derived)
+  )
+
+sum(is.na(d$pl_orbsmax) & !is.na(d$orbsmax_derived))
+```
+
+That recovers `r sum(is.na(d$pl_orbsmax) & !is.na(d$orbsmax_derived))` additional usable rows for anything that needs orbital distance downstream.
+
+Next, stellar luminosity via the Stefan-Boltzmann law (relative to the Sun, using $T_{\odot}=5780$K):
+
+$$\frac{L_\star}{L_\odot} = \left(\frac{R_\star}{R_\odot}\right)^2 \left(\frac{T_\star}{5780}\right)^4$$
+
+```{r luminosity}
+d <- d %>% mutate(L_star = (st_rad)^2 * (st_teff / 5780)^4)
+```
+
+And a zero-albedo equilibrium temperature, computed independently rather than trusting the archive's own `pl_eqt` column (which is missing for `r sum(is.na(d$pl_eqt))` of `r nrow(d)` rows - about 72%, since it depends on assumptions the archive doesn't always fill in):
+
+$$T_{eq} = T_\star \sqrt{\frac{R_\star}{2a}}$$
+
+```{r eqtemp}
+d <- d %>%
+  mutate(
+    st_rad_au = st_rad * 0.00465047,  # 1 solar radius in AU
+    pl_eqt_derived = ifelse(!is.na(st_teff) & !is.na(st_rad_au) & !is.na(a_au) & a_au > 0,
+                             st_teff * sqrt(st_rad_au / (2 * a_au)),
+                             NA_real_)
+  )
+
+sum(!is.na(d$pl_eqt_derived))
+```
+
+Deriving it this way covers `r sum(!is.na(d$pl_eqt_derived))` rows, versus `r sum(!is.na(d$pl_eqt))` for the archive's own column - roughly three times the coverage, which matters a lot for the modeling step later since equilibrium temperature is one of the predictors.
+
+Finally, habitable zone classification. The commonly used "conservative" habitable zone (Kasting et al. 1993, with $S_{eff}$ values recalculated by Kopparapu et al. 2013) runs from the moist-greenhouse limit ($S_{eff}=1.01$) to the maximum-greenhouse limit ($S_{eff}=0.35$), referenced to a Sun-like star. Since flux falls off as $1/d^2$, the boundary distances are:
+
+$$d = \sqrt{\frac{L_\star/L_\odot}{S_{eff}}} \text{ AU}$$
+
+```{r habitable-zone}
+d <- d %>%
+  mutate(
+    hz_inner_au = sqrt(L_star / 1.01),
+    hz_outer_au = sqrt(L_star / 0.35),
+    in_hz = ifelse(!is.na(a_au) & !is.na(hz_inner_au) & !is.na(hz_outer_au),
+                    a_au >= hz_inner_au & a_au <= hz_outer_au,
+                    NA)
+  )
+
+d %>% summarize(classifiable = sum(!is.na(in_hz)), in_habitable_zone = sum(in_hz, na.rm = TRUE))
+```
+
+`r sum(d$in_hz, na.rm=TRUE)` of the `r sum(!is.na(d$in_hz))` classifiable planets fall in their star's conservative habitable zone - a bit over 2%, which lines up with what's generally reported for the known exoplanet population (most detected planets orbit very close to their star, well inside the habitable zone, simply because short-period planets are far easier to detect).
+
+I should flag a real limitation here: I'm using fixed $S_{eff}$ boundaries calibrated to a Sun-like star. The full Kopparapu et al. (2013, 2014) treatment makes these boundaries a polynomial function of stellar temperature, which matters more for cooler M-dwarf stars. I used the simpler fixed-boundary version to keep the derivation transparent and easy to check by hand; a more careful version of this project would use the temperature-dependent formula.
+
+```{r save-engineered}
+write.csv(d, "exoplanets_engineered.csv", row.names = FALSE)
+```
+
+## Exploring the data
+
+The two variables at the center of the modeling problem - mass and radius - both span several orders of magnitude, which is the first thing that shapes the whole modeling approach:
+
+```{r mass-radius-plot, fig.height=3.5}
+d %>%
+  filter(!is.na(pl_bmasse), !is.na(pl_rade), pl_bmasse > 0, pl_rade > 0) %>%
+  ggplot(aes(x = pl_rade, y = pl_bmasse)) +
+  geom_point(alpha = 0.4, color = "steelblue", size = 1.2) +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "Planet radius (Earth radii, log scale)",
+       y = "Planet mass (Earth masses, log scale)",
+       title = "Exoplanet mass-radius relationship") +
+  theme_minimal()
+```
+
+That's the shape I expected going in, but it's still worth pointing out why it looks like this: a fairly tight rising trend up to around 10-15 Earth radii, then a plateau where mass barely increases with radius anymore. That plateau is real physics, not noise - it's where planets stop being made of rock and start being gas giants, and gas giant radius is set by electron degeneracy pressure pushing back against gravity rather than by how much material is there. Packing in more mass barely changes the radius once you're in that regime. This is basically why a single global mass-radius power law was never going to be a great fit for the full sample, and it's a big part of why I expected the tree-based models to outperform plain linear regression later on.
+
+Discovery method matters too, and not just as a footnote - it directly explains a lot of the missingness patterns:
+
+```{r discovery-plot, fig.height=3.5}
+d %>%
+  count(disc_year, discoverymethod) %>%
+  filter(discoverymethod %in% c("Transit", "Radial Velocity", "Imaging", "Microlensing")) %>%
+  ggplot(aes(x = disc_year, y = n, fill = discoverymethod)) +
+  geom_col() +
+  labs(x = "Discovery year", y = "Number of planets",
+       title = "Exoplanet discoveries by year and method", fill = "Method") +
+  theme_minimal()
+```
+
+The Kepler-era transit boom around 2014-2016 dominates the plot, and it's exactly transit-discovered planets that are most likely to have radius without mass - which is the whole motivation for this project in the first place.
+
+The habitable zone diagram makes the detection bias even clearer:
+
+```{r hz-plot, fig.height=3.5}
+d %>%
+  filter(!is.na(a_au), !is.na(L_star), L_star > 0, L_star < 20, a_au < 10) %>%
+  ggplot(aes(x = a_au, y = L_star, color = in_hz)) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_x_log10() + scale_y_log10() +
+  scale_color_manual(values = c("grey70", "darkgreen"), na.value = "grey90",
+                      labels = c("Outside HZ", "In conservative HZ", "Not classified")) +
+  labs(x = "Orbital distance (AU, log scale)", y = "Stellar luminosity (solar units, log scale)",
+       title = "Habitable zone classification", color = "") +
+  theme_minimal()
+```
+
+The green points trace out a clean diagonal band - which makes sense, since the HZ boundary scales as $\sqrt{L_\star}$, so it's a straight line in log-log space by construction. What's more interesting is the huge grey cloud bunched up at small orbital distances: the overwhelming majority of known exoplanets orbit far closer to their star than the habitable zone, simply because close-in planets are much easier to detect (shorter transits, bigger radial-velocity signal). The habitable zone isn't underpopulated because habitable planets are rare - it's underpopulated because they're hard to find with current methods.
+
+## Modeling approach
+
+For the regression task, I kept only rows with a complete predictor set: mass, radius, orbital period, and all three stellar parameters, plus my own derived equilibrium temperature.
+
+```{r model-data}
+model_data <- d %>%
+  filter(!is.na(pl_bmasse), !is.na(pl_rade), !is.na(pl_orbper),
+         !is.na(st_teff), !is.na(st_rad), !is.na(st_mass),
+         !is.na(pl_eqt_derived)) %>%
+  filter(pl_bmasse > 0, pl_rade > 0, pl_orbper > 0) %>%
+  transmute(
+    pl_name,
+    log_mass = log10(pl_bmasse),
+    log_radius = log10(pl_rade),
+    log_period = log10(pl_orbper),
+    st_teff, st_rad, st_mass,
+    eqt = pl_eqt_derived
+  )
+
+nrow(model_data)
+```
+
+That leaves `r nrow(model_data)` planets - a real, workable sample size, and actually comparable to what's used in published mass-radius studies in this field. Mass and radius are both log-transformed for the reasons the mass-radius plot already made clear; period is log-transformed too since orbital periods span a similarly huge range (from under a day to thousands of days).
+
+```{r rmse-function}
+RMSE <- function(true, pred) sqrt(mean((true - pred)^2))
+```
+
+```{r train-test-split}
+set.seed(1)
+test_index <- createDataPartition(model_data$log_mass, p = 0.2, list = FALSE)
+train_set <- model_data[-test_index, ]
+test_set  <- model_data[test_index, ]
+nrow(train_set); nrow(test_set)
+```
+
+I compared three models, deliberately picking approaches that make different assumptions:
+
+**Linear regression** on the log-transformed variables - this mirrors the classical empirical mass-radius power-law relations used in the literature, and gives an interpretable baseline: each coefficient is roughly "how much does log(mass) change per unit change in this predictor."
+
+```{r model-lm}
+lm_fit <- lm(log_mass ~ log_radius + log_period + st_teff + st_rad + st_mass + eqt,
+             data = train_set)
+pred_lm <- predict(lm_fit, newdata = test_set)
+rmse_lm <- RMSE(test_set$log_mass, pred_lm)
+rmse_lm
+summary(lm_fit)$coefficients
+```
+
+The radius coefficient comes out close to 2, meaning mass scales roughly as radius-squared over this sample - which is a steeper relationship than the classical rocky-planet mass-radius relation (closer to radius-cubed for constant density, or shallower for the gas giant plateau I described earlier), reflecting the fact that this sample is a mix of very different planet types with a single line forced through all of them.
+
+**Random forest** - handles non-linearity and interactions between predictors without needing to specify them:
+
+```{r model-rf}
+set.seed(1)
+rf_fit <- randomForest(log_mass ~ log_radius + log_period + st_teff + st_rad + st_mass + eqt,
+                        data = train_set, ntree = 500, importance = TRUE)
+pred_rf <- predict(rf_fit, newdata = test_set)
+rmse_rf <- RMSE(test_set$log_mass, pred_rf)
+rmse_rf
+```
+
+**Gradient boosting** - builds trees sequentially, each one correcting the errors of the ensemble so far; tuned via 5-fold cross-validation on the training set to pick the number of trees:
+
+```{r model-gbm, cache=TRUE}
+set.seed(1)
+gbm_fit <- gbm(log_mass ~ log_radius + log_period + st_teff + st_rad + st_mass + eqt,
+               data = train_set, distribution = "gaussian",
+               n.trees = 1000, interaction.depth = 3, shrinkage = 0.01,
+               cv.folds = 5, verbose = FALSE)
+best_iter <- gbm.perf(gbm_fit, method = "cv", plot.it = FALSE)
+best_iter
+pred_gbm <- predict(gbm_fit, newdata = test_set, n.trees = best_iter)
+rmse_gbm <- RMSE(test_set$log_mass, pred_gbm)
+rmse_gbm
+```
+
+# Results
+
+```{r results-table}
+results <- tibble(
+  model = c("Linear regression", "Random forest", "Gradient boosting"),
+  RMSE_log10_mass = c(rmse_lm, rmse_rf, rmse_gbm),
+  R2 = c(
+    cor(test_set$log_mass, pred_lm)^2,
+    cor(test_set$log_mass, pred_rf)^2,
+    cor(test_set$log_mass, pred_gbm)^2
+  )
+)
+knitr::kable(results, digits = 4)
+```
+
+```{r results-plot, fig.height=3}
+results %>%
+  ggplot(aes(x = reorder(model, -RMSE_log10_mass), y = RMSE_log10_mass)) +
+  geom_col(fill = "darkorange") +
+  geom_text(aes(label = round(RMSE_log10_mass, 3)), vjust = -0.5) +
+  labs(x = NULL, y = "Test set RMSE (log10 Earth masses)", title = "Model comparison") +
+  theme_minimal()
+```
+
+Gradient boosting comes out slightly ahead of random forest, and both meaningfully beat linear regression - RMSE drops from `r round(rmse_lm,3)` to `r round(rmse_gbm,3)`, and $R^2$ goes from `r round(cor(test_set$log_mass, pred_lm)^2,3)` to `r round(cor(test_set$log_mass, pred_gbm)^2,3)`. Given the mass-radius plot from earlier, this isn't surprising: a dataset that mixes rocky planets, ice giants, and gas giants together has real non-linear structure (that plateau) that a single straight line in log-log space just can't represent, no matter how many other predictors get added to it.
+
+```{r importance-plot, fig.height=3.5}
+imp <- as.data.frame(importance(rf_fit))
+imp$variable <- rownames(imp)
+imp %>%
+  ggplot(aes(x = reorder(variable, `%IncMSE`), y = `%IncMSE`)) +
+  geom_col(fill = "seagreen") +
+  coord_flip() +
+  labs(x = NULL, y = "% increase in MSE when permuted",
+       title = "Random forest variable importance") +
+  theme_minimal()
+```
+
+Radius dominates by a wide margin, which lines up with both the linear regression coefficients and with basic exoplanet physics - it's by far the strongest single predictor of mass, which is exactly why empirical mass-radius relations are a real, published subfield of this science rather than something I invented for this project.
+
+```{r pred-actual-plot, fig.height=3.5}
+tibble(actual = test_set$log_mass, predicted = pred_gbm) %>%
+  ggplot(aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.5, color = "purple") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+  labs(x = "Actual log10(mass)", y = "Predicted log10(mass)",
+       title = "Gradient boosting: predicted vs actual (test set)") +
+  theme_minimal()
+```
+
+Predictions track the diagonal reasonably well across most of the range, with the most visible scatter for the smallest planets - which makes sense, since Earth-to-Neptune-sized planets are exactly the regime where composition (rocky core vs. thick atmosphere vs. a lot of water) varies the most for a given radius, so radius alone carries less information about mass there than it does for gas giants.
+
+# Conclusion
+
+The main finding is a straightforward one: predicting exoplanet mass from radius, orbital period, and stellar parameters works reasonably well (test RMSE of `r round(rmse_gbm,3)` in log10 Earth masses, or roughly a factor of `r round(10^rmse_gbm,2)` typical multiplicative error), and non-linear models clearly outperform a single log-log line, which fits the underlying physics - the mass-radius relationship genuinely changes character between rocky planets and gas giants, so a model flexible enough to represent that split has a real advantage. This kind of relationship, applied carefully, could help prioritize which transit-only planets are worth spending radial-velocity telescope time on, or give a rough working mass estimate for planets where that follow-up isn't realistically going to happen.
+
+There are real limitations worth being upfront about. The habitable-zone calculation uses fixed flux boundaries calibrated to a Sun-like star rather than the full temperature-dependent Kopparapu formula, which matters more for cooler stars. The regression sample, while a reasonable size, is still shaped by detection bias - the archive is dominated by planets that are easy to detect (short-period, larger), so the model is most trustworthy in that same regime and less so for smaller or longer-period planets it's seen fewer examples of. And a single mass-radius-type relationship, however flexible the model, is always going to be a simplification - actual planet mass depends on internal composition and history in ways that radius and orbital parameters only partially capture.
+
+For future work, the most obvious next step would be splitting the sample by radius regime (rocky vs. sub-Neptune vs. gas giant) and fitting separate models to each, rather than asking one model to capture the whole transition - the mass-radius plot makes a strong case that these are genuinely different populations. Bringing in stellar metallicity (available in the raw data but not used here) could help too, since it's known to correlate with giant planet occurrence. And replacing the fixed-boundary habitable zone calculation with the full Kopparapu et al. (2013, 2014) temperature-dependent version would make that part of the analysis more rigorous, particularly for the M-dwarf systems that are increasingly common in newer discoveries.
+
+# References
+
+- NASA Exoplanet Archive, operated by the California Institute of Technology, under contract with NASA: https://exoplanetarchive.ipac.caltech.edu
+- Akeson, R. L., et al. (2013). "The NASA Exoplanet Archive: Data and Tools for Exoplanet Research." *Publications of the Astronomical Society of the Pacific*, 125(930), 989.
+- Kasting, J. F., Whitmire, D. P., & Reynolds, R. T. (1993). "Habitable Zones around Main Sequence Stars." *Icarus*, 101(1), 108-128.
+- Kopparapu, R. K., et al. (2013). "Habitable Zones around Main-sequence Stars: New Estimates." *The Astrophysical Journal*, 765(2), 131.
+- Chen, J., & Kipping, D. (2017). "Probabilistic Forecasting of the Masses and Radii of Other Worlds." *The Astrophysical Journal*, 834(1), 17.
